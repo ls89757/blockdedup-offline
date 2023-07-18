@@ -6,8 +6,10 @@ import hashlib
 import time
 import sys
 import pickle
-
+from stat import *
 BLOCK_SIZE = 4096
+inline_data_size = 0
+file_cnt = 0
 class fiemap_layout:
     def __init__(self):
         self.fm_start = 0
@@ -31,6 +33,9 @@ class fiemap_extent:
 
 def get_fiemap_info(file):
     # 打开文件
+    global file_cnt
+    file_cnt +=1
+    print(file,":",file_cnt)
     fd = os.open(file, os.O_RDONLY)
 
     # 获取文件系统块大小
@@ -67,6 +72,9 @@ def create_table():
     c.execute('''
     CREATE TABLE ino_lbn (ino INTEGER, lbn INTEGER, pbn INTEGER, fingerprint TEXT, PRIMARY KEY (ino, lbn))
     ''')
+    c.execute('''
+    CREATE TABLE ino (ino INTEGER, du INTEGER , fingerprint TEXT, PRIMARY KEY (ino))
+    ''')
     # c.execute('''
     # CREATE TABLE fingerprint (fingerprint TEXT, PRIMARY KEY (fingerprint))
     # ''')
@@ -83,21 +91,25 @@ def create_table():
 def insert_data():
     conn = sqlite3.connect('dedup.db')
     c = conn.cursor()
-    ino_lbn_data = [
-        (1, 0), (1,1) , (1,2) ,(2,0) , (2,1) , (2,2)
-    ]
-    c.executemany('''
-    INSERT INTO ino_lbn (ino, lbn) VALUES( ?, ?) 
-    ''' , ino_lbn_data)
-    fingerprint_data = [
-        ("abcd1234564a",), ("12356446ddea",),
-    ]
-    c.executemany('''
-    INSERT INTO fingerprint (fingerprint) VALUES (?)
-    ''' ,fingerprint_data)
+    # ino_lbn_data = [
+    #     (1, 0), (1,1) , (1,2) ,(2,0) , (2,1) , (2,2)
+    # ]
+    # c.executemany('''
+    # INSERT INTO ino_lbn (ino, lbn) VALUES( ?, ?) 
+    # ''' , ino_lbn_data)
+    # fingerprint_data = [
+    #     ("abcd1234564a",), ("12356446ddea",),
+    # ]
+    # c.executemany('''
+    # INSERT INTO fingerprint (fingerprint) VALUES (?)
+    # ''' ,fingerprint_data)
+    # c.execute('''
+    # INSERT INTO pbn (pbn, fingerprint, ino ,lbn) VALUES (1234, ? , ? ,? )
+    # ''', (fingerprint_data[0][0], ino_lbn_data[0][0], ino_lbn_data[0][1]))
+
     c.execute('''
-    INSERT INTO pbn (pbn, fingerprint, ino ,lbn) VALUES (1234, ? , ? ,? )
-    ''', (fingerprint_data[0][0], ino_lbn_data[0][0], ino_lbn_data[0][1]))
+    INSERT INTO ino_lbn (ino, lbn, fingerprint) VALUES (?, ? , ?)
+    ''', (12345,54321,"1234556787asdas"));
 
     conn.commit()
 
@@ -109,16 +121,19 @@ def compute_hash(bytes):
     md5.update(bytes)
     return  md5.hexdigest()
 def store_metadata(file_path,fiemap, ino,cur):
+    global inline_data_size
     if fiemap.fm_mapped_extents == 0:
-        assert( os.path.getsize(file_path) == 0)
+        pass
+        #assert( os.path.getsize(file_path) == 0)
     else:
         with open(file_path,'rb') as f:
             ino_lbn_data = []
-            #fingerprint_data = []
-            #pbn_data = []
-            #print(fiemap.fm_extents)
-            print("file extents:",file_path)
+            #print(file_path)
             for extents in fiemap.fm_extents:
+                if(extents.fe_length%BLOCK_SIZE !=0):
+                    print("[inline data size]:", extents.fe_length)
+                    inline_data_size += extents.fe_length
+                    continue
                 assert(extents.fe_length%BLOCK_SIZE ==0)
                 assert(extents.fe_logical%BLOCK_SIZE==0)
                 assert(extents.fe_physical%BLOCK_SIZE==0)
@@ -128,15 +143,11 @@ def store_metadata(file_path,fiemap, ino,cur):
                 for i in range(0,block_counts):
                     #ino_lbn_data.append((ino, start_block_num+i,))
                     file_pos = extents.fe_logical + i*BLOCK_SIZE
-                    #print("f.tell():",f.tell(), "file_pos:", file_pos)
                     f.seek(file_pos)
                     #assert(file_pos == f.tell())
                     datablock = bytearray(f.read(BLOCK_SIZE))
                     fingerprint = compute_hash(datablock)
                     ino_lbn_data.append((ino,start_block_num+i, extents.fe_physical//BLOCK_SIZE+i,fingerprint))
-                    #print(ino_lbn_data[-1])
-                    #fingerprint_data.append((fingerprint,))
-                    #pbn_data.append((extents.fe_physical//BLOCK_SIZE+i,fingerprint,ino,start_block_num+i,))
             try:
                 cur.executemany('''
                 INSERT INTO ino_lbn (ino,lbn,pbn,fingerprint) VALUES(?,?,?,?)
@@ -150,18 +161,38 @@ def store_metadata(file_path,fiemap, ino,cur):
             except sqlite3.Error as e:
                 print("An error occurred:", e.args[0])
                 
+def store_file_metadata(file_path,ino,cur):
+    try:
+        md5txt = os.popen(f'md5sum "{file_path}"').read().split(' ')[0]
+        disk_space = os.popen(f'du -s --block-size=1 "{file_path}"').read().rstrip('\n').split('\t')[0]
+        cur.execute('''
+        INSERT INTO ino (ino,fingerprint,du) VALUES(?,?,?)
+        ''', (ino,md5txt,int(disk_space)))
+    except Exception as e:
+        print("error:",e)
+        return 
 def build_index(file_path):
+    # fixme: store_file_metadata为每个文件都建立的指纹索引
+    # 而store_metadata仅仅针对4k对齐的块数据建立的指纹索引
     conn = sqlite3.connect('dedup.db')
     cur = conn.cursor()
-    stat_info = os.stat(file_path)
-    #print(file_path)
-    ino = stat_info.st_ino
-    file_size = stat_info.st_size
-    #print("file_size:",file_size, "blocks_count:", stat_info.st_blocks)
-    (block_size, fiemap) =  get_fiemap_info(file_path)
-    assert(block_size==4096)
-    #print(fiemap.fm_extents)
+    try:
+        if(os.path.islink(file_path)):
+            print("[symbolic link]:",file_path)
+            return
+        stat_info = os.stat(file_path)
+        if(S_ISFIFO(stat_info.st_mode)):
+            print("[pipe file]:", file_path)
+            return
+        ino = stat_info.st_ino
+        file_size = stat_info.st_size
+        (block_size, fiemap) =  get_fiemap_info(file_path)
+        assert(block_size==4096)
+    except Exception as e:
+        print("err:",e)
+        return
     store_metadata(file_path,fiemap, ino,cur)
+    store_file_metadata(file_path,ino,cur)
     conn.commit()
     conn.close()
 
@@ -170,7 +201,7 @@ def traverse(path):
     for root, dirs, files in os.walk(path):
         for name in files:
             file_path = os.path.join(root, name)
-            print(file_path)
+            #print(file_path)
             build_index(file_path=file_path)
         # for name in dirs:
         #     dir_path = os.path.join(root, name)
@@ -219,11 +250,24 @@ def list_table():
     # c.execute('''
     #             SELECT * from ino_lbn group by fingerprint having count(*)>1  order by fingerprint 
     # ''')
+    c.execute('select * from ino_lbn')
+    result = c.fetchall()
+    print("all blocks count in db:",len(result))
     c.execute('''
     SELECT fingerprint,GROUP_CONCAT(ino,','),GROUP_CONCAT(lbn,','), GROUP_CONCAT(pbn,',') from ino_lbn group by fingerprint having count(*)>1  order by fingerprint 
         ''')
     result = c.fetchall()
-    #print(len(result))
+    print("all unique blocks count in db:", len(result))
+    result = sorted(result, key=lambda item: len(item[1].split(',')),reverse=True)
+    print("Hot 100 fingerprint:")
+    for i in range(0,100):
+        print(i, ": fingerprint:", result[i][0]," count:",len(result[i][1].split(',')))
+        ino_list = result[i][1].split(',')
+        lbn_list = result[i][2].split(',')
+        for j in range(0,min(100,len(ino_list))):
+            print(f'[{ino_list[j]},{lbn_list[j]}]', end=' ')
+        print()
+    #print(result[1])
     #f = open('./tmp', 'w')
     #pickle.dump(result[0:50],f)
     
@@ -235,14 +279,16 @@ def list_table():
     conn.close()
 
 create_table()
-os.system("sudo mount ./f2fs.img /mnt/sdcmount -o noinline_xattr,nouser_xattr,noinline_data,noinline_dentry")
-traverse("/mnt/sdcmount")
+#os.system("sudo mount ./f2fs.img /mnt/sdcmount -o noinline_xattr,nouser_xattr,noinline_data,noinline_dentry")
+#traverse("/mnt/android/f2fs/")
+traverse("/home/host/blockdedup-offline/test/")
+
 #traverse("/home/host/blockdedup-offline")
 #traverse("/home/host/src-highlite")
 #traverse("/home/host/portdedup")
-sys.path.append('./')
-import f2fshack
-get_dedup_info()
+# sys.path.append('./')
+# import f2fshack
+# get_dedup_info()
 #list_table()
 
 # sys.path.append('/home/host/blockdedup-offline')
@@ -250,9 +296,3 @@ get_dedup_info()
 # print(f2fshack.open_device())
 #get_dedup_info()
 
-
-
-
-# sqlite_demo()
-#create_table()
-#insert_data()

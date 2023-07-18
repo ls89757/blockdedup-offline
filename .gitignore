@@ -1,6 +1,10 @@
+db/
+*.db-journal
 # Prerequisites
 *.d
-
+.ipynb_checkpoints/
+*.db.bak
+*.db
 # Object files
 *.o
 *.ko
